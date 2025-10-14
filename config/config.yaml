@@ -1,0 +1,17 @@
+mcp_server:
+  command: uvx
+  args:
+    - mcp-server-sqlite
+    - --db-path
+    - test.db
+
+llm:
+  model: gpt-4o
+  base_url: null
+
+database:
+  path: test.db
+
+system_prompt: >
+  You are a helpful assistant that can use tools to help answer questions.
+
