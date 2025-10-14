@@ -51,6 +51,14 @@ pytest-asyncio = ">=0.21.0"
 pytest-mock = ">=3.10.0"
 pytest-aiohttp = ">=1.0.4"
 
+[tool.poetry.extras]
+test = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-mock>=3.10.0",
+    "pytest-aiohttp>=1.0.4",
+]
+
 [build-system]
 requires = ["setuptools>=45", "wheel"]
 build-backend = "setuptools.build_meta"
