@@ -1,110 +1,195 @@
-# src/mcp_llm_bridge/llm_client.py
-from typing import Dict, List, Any, Optional
-import openai
-from mcp_llm_bridge.config import LLMConfig
+# llm_client.py
+import asyncio
 import logging
-import colorlog
+from typing import Any, Dict, List, Optional
 
-handler = colorlog.StreamHandler()
-handler.setFormatter(colorlog.ColoredFormatter(
-    "%(log_color)s%(levelname)s%(reset)s:     %(cyan)s%(name)s%(reset)s - %(message)s",
-    datefmt=None,
-    reset=True,
-    log_colors={
-        'DEBUG': 'cyan',
-        'INFO': 'green',
-        'WARNING': 'yellow',
-        'ERROR': 'red',
-        'CRITICAL': 'red,bg_white',
-    },
-    secondary_log_colors={},
-    style='%'
-))
+from openai import OpenAI
 
-logger = colorlog.getLogger(__name__)
-logger.addHandler(handler)
-logger.setLevel(logging.INFO)
+from mcp_llm_bridge.config import LLMConfig
+
+logger = logging.getLogger(__name__)
+
 
 class LLMResponse:
-    """Standardized response format focusing on tool handling"""
-    def __init__(self, completion: Any):
-        self.completion = completion
-        self.choice = completion.choices[0]
-        self.message = self.choice.message
-        self.stop_reason = self.choice.finish_reason
-        self.is_tool_call = self.stop_reason == "tool_calls"
-        
-        # Format content for bridge compatibility
-        self.content = self.message.content if self.message.content is not None else ""
-        self.tool_calls = self.message.tool_calls if hasattr(self.message, "tool_calls") else None
-        
-        # Debug logging
-        logger.debug(f"Raw completion: {completion}")
-        logger.debug(f"Message content: {self.content}")
-        logger.debug(f"Tool calls: {self.tool_calls}")
-        
-    def get_message(self) -> Dict[str, Any]:
-        """Get standardized message format"""
-        return {
-            "role": "assistant",
-            "content": self.content,
-            "tool_calls": self.tool_calls
-        }
+    """
+    Thin wrapper around an OpenAI chat completion choice.message
+    that normalizes tool-call detection and exposes message content.
+    """
+
+    def __init__(self, message: Any, finish_reason: Optional[str] = None) -> None:
+        # The raw OpenAI message object
+        self.message = message
+
+        # Final text content (if any)
+        self.content: str = getattr(message, "content", None) or ""
+
+        # Tool calls (if any)
+        self.tool_calls = getattr(message, "tool_calls", None)
+        # Some SDK variants expose a dict-like structure; tolerate both
+        if self.tool_calls is None and isinstance(message, dict):
+            self.tool_calls = message.get("tool_calls")
+
+        # Robust tool-call detection:
+        # - Prefer the presence of tool_calls
+        # - Also consider finish_reason=="tool_calls" as a hint
+        self.is_tool_call: bool = bool(self.tool_calls) or (finish_reason == "tool_calls")
+
 
 class LLMClient:
-    """Client for interacting with OpenAI-compatible LLMs"""
-    
-    def __init__(self, config: LLMConfig):
-        self.config = config
-        self.client = openai.OpenAI(
-            api_key=config.api_key,
-            base_url=config.base_url
+    """
+    Small client over an OpenAI-compatible Chat Completions endpoint.
+    Handles:
+      - message list management
+      - function/tool schema registration
+      - adding tool results
+      - non-blocking invoke (runs sync HTTP call off the event loop)
+    """
+
+    def __init__(self, config: LLMConfig) -> None:
+        self.cfg = config
+
+        # OpenAI client; works with OpenAI and OpenAI-compatible routers if base_url is set.
+        self._client = OpenAI(
+            api_key=self.cfg.api_key,
+            base_url=self.cfg.base_url,  # type: ignore[arg-type]
         )
-        self.tools = []
-        self.messages = []
-        self.system_prompt = None
-    
-    def _prepare_messages(self) -> List[Dict[str, Any]]:
-        """Prepare messages for API call"""
-        formatted_messages = []
-        
-        if self.system_prompt:
-            formatted_messages.append({
-                "role": "system",
-                "content": self.system_prompt
-            })
-            
-        formatted_messages.extend(self.messages)
-        return formatted_messages
-    
-    async def invoke_with_prompt(self, prompt: str) -> LLMResponse:
-        """Send a single prompt to the LLM"""
-        self.messages.append({
-            "role": "user",
-            "content": prompt
-        })
-        
-        return await self.invoke([])
-    
-    async def invoke(self, tool_results: Optional[List[Dict[str, Any]]] = None) -> LLMResponse:
-        """Invoke the LLM with optional tool results"""
-        if tool_results:
-            for result in tool_results:
-                self.messages.append({
-                    "role": "tool",
-                    "content": str(result.get("output", "")),  # Convert to string and provide default
-                    "tool_call_id": result["tool_call_id"]
-                })
-        
-        completion = self.client.chat.completions.create(
-            model=self.config.model,
-            messages=self._prepare_messages(),
-            tools=self.tools if self.tools else None,
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens
+
+        # Chat history, OpenAI format
+        self._messages: List[Dict[str, Any]] = []
+
+        # Function tools in OpenAI schema
+        self._tools: Optional[List[Dict[str, Any]]] = None
+
+    # -------------------------
+    # Setup
+    # -------------------------
+    def set_system_prompt(self, text: str) -> None:
+        """
+        Prepend a system message to steer the assistant.
+        Call before adding any user messages for best effect.
+        """
+        if not text:
+            return
+        # Ensure only one system message is at the front
+        if self._messages and self._messages[0].get("role") == "system":
+            self._messages[0]["content"] = text
+        else:
+            self._messages.insert(0, {"role": "system", "content": text})
+
+    def set_tools(self, tools: List[Dict[str, Any]]) -> None:
+        """
+        Register OpenAI function tools.
+        """
+        self._tools = tools or []
+
+    # -------------------------
+    # Message management
+    # -------------------------
+    def add_user_message(self, content: str) -> None:
+        self._messages.append({"role": "user", "content": content})
+
+    def add_tool_result(self, *, tool_call_id: str, name: str, content: str) -> None:
+        """
+        Add a tool result to the conversation so the model can see it on the next turn.
+        OpenAI expects role="tool" with the matching tool_call_id.
+        """
+        self._messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "name": name,
+                "content": content,
+            }
         )
-        
-        response = LLMResponse(completion)
-        self.messages.append(response.get_message())
-        
-        return response
+
+    # -------------------------
+    # Invocation
+    # -------------------------
+    async def invoke(self) -> LLMResponse:
+        """
+        Invoke the chat completion in a non-blocking way.
+        We use asyncio.to_thread to avoid blocking the event loop with the sync client.
+        """
+        model = self.cfg.model
+
+        # Base request payload
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": self._messages,
+        }
+
+        if self._tools:
+            payload["tools"] = self._tools
+            payload["tool_choice"] = "auto"
+
+        # Optional tuning knobs
+        if self.cfg.temperature is not None:
+            payload["temperature"] = float(self.cfg.temperature)
+        if self.cfg.top_p is not None:
+            payload["top_p"] = float(self.cfg.top_p)
+        if self.cfg.max_tokens is not None:
+            payload["max_tokens"] = int(self.cfg.max_tokens)
+
+        # Merge any future extras
+        if self.cfg.extra:
+            for k, v in self.cfg.extra.items():
+                # Don't stomp on known keys
+                if k not in payload:
+                    payload[k] = v
+
+        def _call_sync() -> Any:
+            return self._client.chat.completions.create(**payload)
+
+        try:
+            completion = await asyncio.to_thread(_call_sync)
+        except Exception as e:
+            logger.exception("LLM invocation failed: %s", e)
+            # Surface the error back as an assistant message so the REPL doesn't break
+            err_msg = {"role": "assistant", "content": f"[llm_error] {type(e).__name__}: {e}"}
+            self._messages.append(err_msg)
+            return LLMResponse(err_msg, finish_reason="stop")
+
+        # Extract the top choice
+        choice = completion.choices[0]
+        finish_reason = getattr(choice, "finish_reason", None)
+        message = choice.message
+
+        # Append the assistant message to our history
+        # (This could be a text reply OR a tool-call stub)
+        serializable_msg = _serialize_openai_message(message)
+        self._messages.append(serializable_msg)
+
+        return LLMResponse(message, finish_reason=finish_reason)
+
+
+# -------------------------
+# Helpers
+# -------------------------
+def _serialize_openai_message(msg: Any) -> Dict[str, Any]:
+    """
+    Convert the SDK message object into a plain dict so it can live in our messages list.
+    This helps ensure consistent behavior across SDK versions.
+    """
+    out: Dict[str, Any] = {"role": getattr(msg, "role", "assistant")}
+    content = getattr(msg, "content", None)
+    if content is not None:
+        out["content"] = content
+
+    tool_calls = getattr(msg, "tool_calls", None)
+    if tool_calls:
+        # Normalize tool_calls to plain dicts
+        norm_calls = []
+        for tc in tool_calls:
+            norm_calls.append(
+                {
+                    "id": getattr(tc, "id", None),
+                    "type": getattr(tc, "type", "function"),
+                    "function": {
+                        "name": getattr(getattr(tc, "function", None), "name", None),
+                        "arguments": getattr(getattr(tc, "function", None), "arguments", None),
+                    },
+                }
+            )
+        out["tool_calls"] = norm_calls
+
+    return out

@@ -1,76 +1,154 @@
-# src/mcp_llm_bridge/mcp_client.py
+# mcp_client.py
+import asyncio
 import logging
-from typing import Any, List
-from mcp import ClientSession, StdioServerParameters
+from typing import Any, Dict, List, Optional, Tuple
+
+from mcp import StdioServerParameters, Tool
+from mcp.client.session import ClientSession
 from mcp.client.stdio import stdio_client
-import colorlog
 
-handler = colorlog.StreamHandler()
-handler.setFormatter(colorlog.ColoredFormatter(
-    "%(log_color)s%(levelname)s%(reset)s:     %(cyan)s%(name)s%(reset)s - %(message)s",
-    datefmt=None,
-    reset=True,
-    log_colors={
-        'DEBUG': 'cyan',
-        'INFO': 'green',
-        'WARNING': 'yellow',
-        'ERROR': 'red',
-        'CRITICAL': 'red,bg_white',
-    },
-    secondary_log_colors={},
-    style='%'
-))
+logger = logging.getLogger(__name__)
 
-logger = colorlog.getLogger(__name__)
-logger.addHandler(handler)
-logger.setLevel(logging.INFO)
 
 class MCPClient:
-    """Client for interacting with MCP servers"""
-    
-    def __init__(self, server_params: StdioServerParameters):
-        self.server_params = server_params
-        self.session = None
-        self._client = None
-        
-    async def __aenter__(self):
-        """Async context manager entry"""
-        await self.connect()
-        return self
-        
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit"""
-        if self.session:
-            await self.session.__aexit__(exc_type, exc_val, exc_tb)
-        if self._client:
-            await self._client.__aexit__(exc_type, exc_val, exc_tb)
+    """
+    Thin async wrapper around an MCP stdio server.
 
-    async def connect(self):
-        """Establishes connection to MCP server"""
-        logger.debug("Connecting to MCP server...")
-        self._client = stdio_client(self.server_params)
-        self.read, self.write = await self._client.__aenter__()
-        session = ClientSession(self.read, self.write)
-        self.session = await session.__aenter__()
-        await self.session.initialize()
-        logger.debug("Connected to MCP server successfully")
+    Lifecycle:
+      - connect(): start the stdio transport and initialize a ClientSession
+      - list_tools(): fetch available tools from the server
+      - call_tool(name, arguments): invoke a tool by name with JSON-able args
+      - close(): cleanly tear down the session and transport
+    """
 
-    async def get_available_tools(self) -> List[Any]:
-        """List available tools"""
-        if not self.session:
-            raise RuntimeError("Not connected to MCP server")
-            
-        logger.debug("Requesting available tools from MCP server")
-        tools = await self.session.list_tools()
-        logger.debug(f"Received tools from MCP server: {tools}")
-        return tools
+    def __init__(self, params: StdioServerParameters) -> None:
+        self.params = params
 
-    async def call_tool(self, tool_name: str, arguments: dict) -> Any:
-        """Call a tool with given arguments"""
-        if not self.session:
-            raise RuntimeError("Not connected to MCP server")
-            
-        logger.debug(f"Calling MCP tool '{tool_name}' with arguments: {arguments}")
-        result = await self.session.call_tool(tool_name, arguments=arguments)
-        logger.debug(f"Tool result: {result}")
-        return result
+        # Context managers we manually enter/exit to control lifetime outside a 'with' block
+        self._stdio_cm = None
+        self._session_cm = None
+
+        # Active transport and session objects once connected
+        self._read = None
+        self._write = None
+        self._session: Optional[ClientSession] = None
+
+        # Track connection state
+        self._connected: bool = False
+
+    # -------------------------
+    # Lifecycle
+    # -------------------------
+    async def connect(self, *, initialize_timeout: float = 30.0) -> None:
+        """
+        Start the stdio transport to the MCP server and initialize a ClientSession.
+        """
+        if self._connected:
+            logger.debug("MCPClient.connect() called but already connected.")
+            return
+
+        logger.info("Starting MCP stdio server: %s %s", self.params.command, " ".join(self.params.args or []))
+
+        # Enter stdio transport context
+        self._stdio_cm = stdio_client(self.params)
+        self._read, self._write = await self._stdio_cm.__aenter__()  # type: ignore[assignment]
+
+        # Enter session context
+        self._session_cm = ClientSession(self._read, self._write)
+        self._session = await self._session_cm.__aenter__()  # type: ignore[assignment]
+
+        # Initialize handshake with an optional timeout
+        try:
+            await asyncio.wait_for(self._session.initialize(), timeout=initialize_timeout)
+        except asyncio.TimeoutError:
+            await self._teardown_on_error()
+            raise TimeoutError("Timed out initializing MCP ClientSession with the server.")
+        except Exception as e:
+            await self._teardown_on_error()
+            raise RuntimeError(f"Failed to initialize MCP ClientSession: {e}") from e
+
+        self._connected = True
+        logger.info("MCP session initialized successfully.")
+
+    async def close(self) -> None:
+        """
+        Cleanly close session and transport contexts.
+        """
+        if not self._connected:
+            # Still attempt to exit contexts if they were partially opened
+            await self._safe_exit_contexts()
+            return
+
+        await self._safe_exit_contexts()
+        self._connected = False
+        logger.info("MCP session closed.")
+
+    # -------------------------
+    # Public API
+    # -------------------------
+    async def list_tools(self) -> List[Tool]:
+        """
+        List tools from the MCP server. Returns an empty list on failure.
+        """
+        if not self._session:
+            raise RuntimeError("MCPClient is not connected. Call connect() first.")
+
+        try:
+            tools = await self._session.list_tools()
+            # Some servers may return None or a non-list; normalize
+            return list(tools or [])
+        except Exception as e:
+            logger.exception("Error listing MCP tools: %s", e)
+            return []
+
+    async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
+        """
+        Call a tool by name on the MCP server with JSON-able arguments.
+        Returns the raw MCP result (often an object with .content).
+        """
+        if not self._session:
+            raise RuntimeError("MCPClient is not connected. Call connect() first.")
+
+        try:
+            result = await self._session.call_tool(name, arguments or {})
+            return result
+        except Exception as e:
+            logger.exception("Error calling MCP tool '%s': %s", name, e)
+            raise
+
+    # -------------------------
+    # Internals
+    # -------------------------
+    async def _teardown_on_error(self) -> None:
+        """
+        Best-effort cleanup used when connect/initialize fails.
+        """
+        try:
+            await self._safe_exit_contexts()
+        finally:
+            self._connected = False
+
+    async def _safe_exit_contexts(self) -> None:
+        """
+        Exit session and stdio contexts in the right order, tolerating partial setup.
+        """
+        # Exit session first
+        if self._session_cm is not None:
+            try:
+                await self._session_cm.__aexit__(None, None, None)
+            except Exception as e:
+                logger.debug("Ignoring session __aexit__ error: %s", e)
+            finally:
+                self._session_cm = None
+                self._session = None
+
+        # Then exit stdio transport
+        if self._stdio_cm is not None:
+            try:
+                await self._stdio_cm.__aexit__(None, None, None)
+            except Exception as e:
+                logger.debug("Ignoring stdio __aexit__ error: %s", e)
+            finally:
+                self._stdio_cm = None
+                self._read = None
+                self._write = None

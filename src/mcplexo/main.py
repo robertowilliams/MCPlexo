@@ -1,107 +1,145 @@
+# main.py
 import os
+import sys
 import asyncio
-import logging
-import colorlog
+from pathlib import Path
+from typing import Any, Dict
+
 import yaml
 from dotenv import load_dotenv
-from pathlib import Path
 from mcp import StdioServerParameters
-from mcplexo.config import BridgeConfig, LLMConfig
-from mcplexo.bridge import BridgeManager
 
-# ---------------------------------------------------------------------------
-# Logging Setup
-# ---------------------------------------------------------------------------
-handler = colorlog.StreamHandler()
-handler.setFormatter(colorlog.ColoredFormatter(
-    "%(log_color)s%(levelname)s%(reset)s: %(cyan)s%(name)s%(reset)s - %(message)s",
-    log_colors={
-        'DEBUG': 'cyan',
-        'INFO': 'green',
-        'WARNING': 'yellow',
-        'ERROR': 'red',
-        'CRITICAL': 'red,bg_white',
-    },
-    style='%'
-))
-logger = colorlog.getLogger(__name__)
-logger.addHandler(handler)
-logger.setLevel(logging.INFO)
+# Fixed: import from the actual package/module name
+from mcp_llm_bridge.config import BridgeConfig, LLMConfig
+from mcp_llm_bridge.bridge import BridgeManager
 
-# ---------------------------------------------------------------------------
-# Helper functions to load configuration
-# ---------------------------------------------------------------------------
-def load_yaml_config():
-    """Load non-sensitive configuration values from config.yaml."""
-    config_path = Path(__file__).resolve().parent / "config" / "config.yaml"
-    with open(config_path, "r") as f:
-        yaml_data = yaml.safe_load(f)
-    return yaml_data
 
-def load_env():
-    """Load sensitive values like API keys from .env."""
-    project_root = Path(__file__).resolve().parents[2]
-    env_path = project_root / ".env"
-    load_dotenv(env_path)
+def load_yaml_config() -> Dict[str, Any]:
+    """
+    Load YAML config from:
+      1) MCPLEXO_CONFIG (absolute/relative path), or
+      2) ./config.yaml in the current working directory, or
+      3) ./config/config.yaml (fallback).
+    """
+    override = os.getenv("MCPLEXO_CONFIG")
+    candidates = []
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-async def main():
-    # Load configurations
-    load_env()
-    yaml_conf = load_yaml_config()
+    if override:
+        candidates.append(Path(override).expanduser().resolve())
 
-    # Extract database path (or default to root/test.db)
-    project_root = Path(__file__).resolve().parents[2]
-    db_path = yaml_conf.get("database", {}).get("path", str(project_root / "test.db"))
+    # Common local defaults
+    candidates.append((Path.cwd() / "config.yaml").resolve())
+    candidates.append((Path.cwd() / "config" / "config.yaml").resolve())
 
-    # Extract LLM configuration from YAML
-    model_name = yaml_conf.get("llm", {}).get("model", "gpt-4o")
-    base_url = yaml_conf.get("llm", {}).get("base_url", None)
+    for path in candidates:
+        if path.exists() and path.is_file():
+            with open(path, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
 
-    # Load API key securely from .env
-    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")
-    if not api_key:
-        logger.warning("No API key found in environment. Please set OPENAI_API_KEY in .env.")
-
-    # Configure the bridge
-    config = BridgeConfig(
-        mcp_server_params=StdioServerParameters(
-            command=yaml_conf.get("mcp_server", {}).get("command", "uvx"),
-            args=yaml_conf.get("mcp_server", {}).get("args", ["mcp-server-sqlite", "--db-path", db_path]),
-            env=None
-        ),
-        llm_config=LLMConfig(
-            api_key=api_key,
-            model=model_name,
-            base_url=base_url
-        ),
-        system_prompt=yaml_conf.get("system_prompt", "You are a helpful assistant that can use tools to help answer questions.")
+    raise FileNotFoundError(
+        "No config YAML found. Set MCPLEXO_CONFIG or place config.yaml in the project root."
     )
 
-    logger.info(f"Starting MCPlexo bridge with model: {config.llm_config.model}")
-    logger.info(f"Database path: {db_path}")
 
-    # Run bridge interaction loop
-    async with BridgeManager(config) as bridge:
-        while True:
-            try:
-                user_input = input("\nEnter your prompt (or 'quit' to exit): ")
-                if user_input.lower() in ['quit', 'exit', 'q']:
-                    break
+def build_configs(yaml_conf: Dict[str, Any]) -> BridgeConfig:
+    """
+    Build LLM and Bridge configs from YAML + environment.
+    """
+    # Load env for API keys, etc.
+    load_dotenv()
 
-                response = await bridge.process_message(user_input)
-                print(f"\nResponse: {response}")
+    # ----- LLM config -----
+    llm_section = yaml_conf.get("llm", {}) or {}
+    llm_model = llm_section.get("model") or os.getenv("OPENAI_MODEL", "gpt-4o")
+    llm_base_url = llm_section.get("base_url") or os.getenv("OPENAI_BASE_URL")
+    llm_api_key = llm_section.get("api_key") or os.getenv("OPENAI_API_KEY")
 
-            except KeyboardInterrupt:
-                logger.info("\nExiting...")
-                break
-            except Exception as e:
-                logger.error(f"Error occurred: {e}")
+    if not llm_api_key:
+        print(
+            "[WARN] No API key provided. Set OPENAI_API_KEY env var or llm.api_key in YAML.",
+            file=sys.stderr,
+        )
 
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
+    llm_cfg = LLMConfig(
+        model=llm_model,
+        api_key=llm_api_key,
+        base_url=llm_base_url,
+    )
+
+    # ----- MCP server (stdio) -----
+    mcp_section = yaml_conf.get("mcp_server", {}) or {}
+    command = mcp_section.get("command") or "uvx"
+    args = mcp_section.get("args") or [
+        "mcp-server-sqlite",
+        "--db-path",
+        "./test.db",
+    ]
+    env = mcp_section.get("env") or {}
+
+    stdio_params = StdioServerParameters(command=command, args=args, env=env)
+
+    # ----- Database path (to keep local tool and MCP server in sync) -----
+    db_section = yaml_conf.get("database", {}) or {}
+    db_path = db_section.get("path")
+
+    # ----- System prompt (optional) -----
+    system_prompt = yaml_conf.get("system_prompt")
+
+    return BridgeConfig(
+        mcp_server_params=stdio_params,
+        llm_config=llm_cfg,
+        system_prompt=system_prompt,
+        db_path=db_path,  # <— NEW: pass through to local DB tool
+    )
+
+
+async def interactive_loop(manager: BridgeManager) -> None:
+    """
+    Simple REPL: read from stdin, send to the bridge, print the assistant response.
+    Type 'exit' or Ctrl-D to quit.
+    """
+    print("MCP LLM Bridge ready. Type your message (or 'exit' to quit).")
+    while True:
+        try:
+            user = input("> ").strip()
+        except EOFError:
+            print()
+            break
+
+        if not user:
+            continue
+        if user.lower() in {"exit", "quit"}:
+            break
+
+        try:
+            response = await manager.process_message(user)
+            # Print final assistant content
+            print(response or "")
+        except KeyboardInterrupt:
+            print("\n[Interrupted]")
+        except Exception as e:
+            print(f"[Error] {e}", file=sys.stderr)
+
+
+async def async_main() -> None:
+    yaml_conf = load_yaml_config()
+    bridge_conf = build_configs(yaml_conf)
+
+    # Spin up the bridge (connects to MCP, syncs tools, etc.)
+    async with BridgeManager(bridge_conf) as manager:
+        await interactive_loop(manager)
+
+
+def main() -> None:
+    try:
+        asyncio.run(async_main())
+    except FileNotFoundError as e:
+        print(f"[Config] {e}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as e:
+        print(f"[Fatal] {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
